@@ -37,11 +37,10 @@ if TYPE_CHECKING:
 class DeepseekV4SparseMLAAttentionImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
     """Abstract parent for DeepseekV4 sparse MLA impls.
 
-    V4 sparse MLA is driven by the layer (``DeepseekV4MLAAttention.forward``)
-    rather than the v1 framework, so ``forward_mqa`` is overridden with a
-    classmethod that takes the layer as its first argument. This Liskov-broken
-    override is intentional: the grandparent's instance-method ``forward_mqa``
-    is never called on V4 layers.
+    V4 sparse MLA is driven by the custom DeepSeek V4 layer rather than the
+    generic v1 MLA layer. Each implementation object is owned by one
+    ``DeepseekV4MLAAttention`` layer so backend-specific state, workspaces, and
+    wrappers live with the backend instead of on the generic layer.
     """
 
     backend_cls: ClassVar[type[AttentionBackend]]
@@ -51,11 +50,12 @@ class DeepseekV4SparseMLAAttentionImpl(SparseMLAAttentionImpl[FlashMLASparseMeta
     # dummy-run path to pre-reserve that workspace.
     PREFILL_CHUNK_SIZE: ClassVar[int] = 4
 
-    @classmethod
+    def __init__(self, layer: "DeepseekV4MLAAttention") -> None:
+        self.layer = layer
+
     @abstractmethod
     def forward_mqa(  # type: ignore[override]
-        cls,
-        layer: "DeepseekV4MLAAttention",
+        self,
         q: torch.Tensor,
         kv: torch.Tensor,
         positions: torch.Tensor,
@@ -126,15 +126,14 @@ class DeepseekV4FlashMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             )
         return 64 if num_heads <= 64 else 128
 
-    @classmethod
     def forward_mqa(  # type: ignore[override]
-        cls,
-        layer: "DeepseekV4MLAAttention",
+        self,
         q: torch.Tensor,
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
+        layer = self.layer
         assert output.shape == q.shape, (
             f"output buffer shape {output.shape} must match q shape {q.shape}"
         )
@@ -159,7 +158,7 @@ class DeepseekV4FlashMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             )
             M = N + layer.window_size + layer.max_num_batched_tokens
             current_workspace_manager().get_simultaneous(
-                ((cls.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
             )
             output.zero_()
             return
@@ -186,7 +185,7 @@ class DeepseekV4FlashMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         num_decode_tokens = swa_metadata.num_decode_tokens
 
         if num_prefills > 0:
-            cls._forward_prefill(
+            self._forward_prefill(
                 layer=layer,
                 q=q[num_decode_tokens:],
                 positions=positions[num_decode_tokens:],
@@ -197,7 +196,7 @@ class DeepseekV4FlashMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 swa_metadata=swa_metadata,
             )
         if num_decodes > 0:
-            cls._forward_decode(
+            self._forward_decode(
                 layer=layer,
                 q=q[:num_decode_tokens],
                 kv_cache=self_kv_cache,

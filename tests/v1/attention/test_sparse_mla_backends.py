@@ -23,6 +23,8 @@ from vllm import _custom_ops as ops
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
+from vllm.v1.attention.backend import AttentionType
 
 # TODO: Integrate ROCMAiterMLASparseBackend for ROCm.
 # The ROCm sparse MLA backend (rocm_aiter_mla_sparse.py) has a compatible
@@ -65,6 +67,120 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
 )
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def _validate_sm120_sparse_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_dtype: str,
+    index_topk: int = 2048,
+    sparse_wrapper_available: bool = True,
+) -> list[str]:
+    monkeypatch.setattr(
+        "vllm.utils.flashinfer.has_flashinfer_sparse_mla",
+        lambda: sparse_wrapper_available,
+    )
+    vllm_config = create_vllm_config(
+        model_name="deepseek-ai/DeepSeek-V3.2-Exp",
+        block_size=64,
+        hf_config_override={"index_topk": index_topk},
+    )
+    vllm_config.model_config.hf_text_config = SimpleNamespace(index_topk=index_topk)
+    with set_current_vllm_config(vllm_config):
+        return FlashInferMLASparseBackend.validate_configuration(
+            head_size=576,
+            dtype=torch.bfloat16,
+            kv_cache_dtype=kv_cache_dtype,
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "bfloat16"])
+def test_flashinfer_sparse_sm120_rejects_unsupported_kv_cache_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_dtype: str,
+):
+    reasons = _validate_sm120_sparse_backend(monkeypatch, kv_cache_dtype)
+    assert "kv_cache_dtype not supported" in reasons
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "fp8_ds_mla"])
+def test_flashinfer_sparse_sm120_accepts_fp8_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_dtype: str,
+):
+    reasons = _validate_sm120_sparse_backend(monkeypatch, kv_cache_dtype)
+    assert reasons == []
+
+
+def test_flashinfer_sparse_sm120_rejects_non_v32_topk(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    reasons = _validate_sm120_sparse_backend(monkeypatch, "fp8_ds_mla", index_topk=128)
+    assert "FLASHINFER_MLA_SPARSE SM120 requires index_topk=2048; got 128" in reasons
+
+
+def test_flashinfer_sparse_sm120_requires_flashinfer_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    reasons = _validate_sm120_sparse_backend(
+        monkeypatch,
+        "fp8_ds_mla",
+        sparse_wrapper_available=False,
+    )
+    assert (
+        "FLASHINFER_MLA_SPARSE SM120 requires FlashInfer's sparse-sm120 MLA wrapper"
+        in reasons
+    )
+
+
+def test_flashinfer_sparse_sm120_impl_requires_flashinfer_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
+        FlashInferMLASparseSM120Impl,
+    )
+
+    monkeypatch.setattr(
+        "vllm.utils.flashinfer.has_flashinfer_sparse_mla",
+        lambda: False,
+    )
+
+    indexer = SimpleNamespace(
+        topk_indices_buffer=torch.empty((1, 2048), dtype=torch.int32)
+    )
+    with pytest.raises(RuntimeError, match="sparse-sm120 MLA wrapper"):
+        FlashInferMLASparseSM120Impl(
+            num_heads=16,
+            head_size=576,
+            scale=1.0,
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="fp8_ds_mla",
+            logits_soft_cap=None,
+            attn_type=AttentionType.DECODER,
+            kv_sharing_target_layer_name=None,
+            indexer=indexer,
+            kv_lora_rank=512,
+        )
+
+
+def test_deepseek_v4_sm120_impl_requires_flashinfer_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.models.deepseek_v4.nvidia import sm120
+
+    monkeypatch.setattr(sm120, "has_flashinfer_sparse_mla", lambda: False)
+
+    with pytest.raises(RuntimeError, match="sparse-sm120 MLA wrapper"):
+        sm120.DeepseekV4FlashInferSM120SparseImpl(SimpleNamespace())
 
 
 def _float_to_e8m0_truncate(f: float) -> float:
@@ -194,6 +310,10 @@ def test_sparse_backend_decode_correctness(
     q_scale: float,
     k_scale: float,
 ):
+    is_flashinfer_sm120 = (
+        backend_cls == FlashInferMLASparseBackend
+        and current_platform.is_device_capability_family(120)
+    )
     if kv_cache_dtype not in backend_cls.supported_kv_cache_dtypes:
         pytest.skip(f"{backend_cls.get_name()} does not support {kv_cache_dtype}")
 
@@ -203,8 +323,13 @@ def test_sparse_backend_decode_correctness(
         and kv_cache_dtype != "fp8_ds_mla"
     ):
         pytest.skip(
-            "FlashMLA Sparse Attention backend fp8 only supports "
-            "fp8_ds_mla kv-cache dtype"
+            f"{backend_cls.get_name()} accepts fp8 at backend-selection time, "
+            "then MLAAttention converts it to fp8_ds_mla before impl construction"
+        )
+    if is_flashinfer_sm120 and kv_cache_dtype != "fp8_ds_mla":
+        pytest.skip(
+            "FLASHINFER_MLA_SPARSE on SM120 uses the normalized fp8_ds_mla "
+            "layout for direct impl tests"
         )
 
     supported_block_sizes = backend_cls.get_supported_kernel_block_sizes()
@@ -217,9 +342,12 @@ def test_sparse_backend_decode_correctness(
         ok, reason = flashmla.is_flashmla_sparse_supported()
         if not ok:
             pytest.skip(reason)
-    elif backend_cls == FlashInferMLASparseBackend:
-        if not current_platform.has_device_capability(100):
-            pytest.skip("FlashInferMLASparseBackend requires SM 10.0 or higher")
+    else:
+        device_capability = current_platform.get_device_capability()
+        if device_capability is None or not backend_cls.supports_compute_capability(
+            device_capability
+        ):
+            pytest.skip(f"{backend_cls.get_name()} does not support this GPU")
 
     batch_spec = SPARSE_BACKEND_BATCH_SPECS[batch_name]
     use_fp8_ds_mla_quantization = kv_cache_dtype == "fp8_ds_mla"
@@ -237,7 +365,9 @@ def test_sparse_backend_decode_correctness(
     qk_rope_head_dim = 64
     v_head_dim = 128
     head_size = kv_lora_rank + qk_rope_head_dim
-    topk_tokens = 128
+    # V32 production configs and SM120 prefill dispatch use index_topk=2048.
+    # Keep the pre-existing FlashMLA/SM10 FlashInfer test shape unchanged.
+    topk_tokens = 2048 if is_flashinfer_sm120 else 128
 
     max_seqlen = max(batch_spec.seq_lens)
     total_cache_tokens = sum(batch_spec.seq_lens)

@@ -58,6 +58,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.attention import (
     DeepseekV4Indexer,
     DeepseekV4MLA,
+    get_deepseek_v4_padded_num_q_heads,
 )
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
@@ -751,9 +752,9 @@ class DeepseekV4Attention(nn.Module):
         self.eps = config.rms_norm_eps
         self.max_position_embeddings = config.max_position_embeddings
 
-        # Padded to min 64 heads for FlashMLA, initialized to -inf
-        # (no sink effect). Weight loading fills the first n_local_heads slots.
-        padded_heads = max(self.n_local_heads, 64)
+        # Must match DeepseekV4MLAAttention.padded_heads; padded entries stay
+        # -inf so they contribute no sink effect.
+        padded_heads = get_deepseek_v4_padded_num_q_heads(self.n_local_heads)
         self.attn_sink = nn.Parameter(
             torch.full((padded_heads,), -float("inf"), dtype=torch.float32),
             requires_grad=False,

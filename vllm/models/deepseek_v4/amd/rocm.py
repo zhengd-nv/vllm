@@ -596,15 +596,14 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
 
-    @classmethod
     def forward_mqa(  # type: ignore[override]
-        cls,
-        layer: "DeepseekV4MLAAttention",
+        self,
         q: torch.Tensor,
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
+        layer = self.layer
         assert output.shape == q.shape, (
             f"output buffer shape {output.shape} must match q shape {q.shape}"
         )
@@ -628,7 +627,7 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             )
             M = N + layer.window_size + layer.max_num_batched_tokens
             current_workspace_manager().get_simultaneous(
-                ((cls.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
             )
             output.zero_()
             return
@@ -653,7 +652,7 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         num_decode_tokens = swa_metadata.num_decode_tokens
 
         if num_prefills > 0:
-            cls._forward_prefill(
+            self._forward_prefill(
                 layer=layer,
                 q=q[num_decode_tokens:],
                 positions=positions[num_decode_tokens:],
@@ -664,7 +663,7 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 swa_metadata=swa_metadata,
             )
         if num_decodes > 0:
-            cls._forward_decode(
+            self._forward_decode(
                 layer=layer,
                 q=q[:num_decode_tokens],
                 kv_cache=self_kv_cache,

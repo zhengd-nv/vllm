@@ -392,24 +392,40 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 num_heads=self.num_heads,
             )
 
-        # FlashMLA Sparse Attention fp8 backend uses "fp8_ds_mla" kv-cache format
-        # Automatically convert fp8 kv-cache format to "fp8_ds_mla"
-        if (
+        uses_flashinfer_sm120_sparse = (
+            self.attn_backend.get_name() == "FLASHINFER_MLA_SPARSE"
+            and current_platform.is_device_capability_family(120)
+        )
+        uses_fp8_ds_mla_cache = (
             self.attn_backend.get_name() == "FLASHMLA_SPARSE"
+            or uses_flashinfer_sm120_sparse
+        )
+        # FlashMLA Sparse and FlashInfer SM120 sparse-MLA use the fp8_ds_mla
+        # KV-cache format. Automatically convert plain fp8 when one of these
+        # variants is selected.
+        if (
+            uses_fp8_ds_mla_cache
             and is_quantized_kv_cache(kv_cache_dtype)
             and kv_cache_dtype != "fp8_ds_mla"
         ):
             assert cache_config is not None
             cache_config.cache_dtype = "fp8_ds_mla"
             kv_cache_dtype = "fp8_ds_mla"
-            logger.info_once(
-                "Using DeepSeek's fp8_ds_mla KV cache format. To use standard "
-                "fp8 kv-cache format, please set `--attention-backend "
-                "FLASHINFER_MLA_SPARSE`"
-            )
+            if uses_flashinfer_sm120_sparse:
+                logger.info_once(
+                    "Using DeepSeek's fp8_ds_mla KV cache format for "
+                    "FLASHINFER_MLA_SPARSE on SM120."
+                )
+            else:
+                logger.info_once(
+                    "Using DeepSeek's fp8_ds_mla KV cache format. To use "
+                    "standard fp8 kv-cache format, please set "
+                    "`--attention-backend FLASHINFER_MLA_SPARSE`"
+                )
 
         if (
             self.attn_backend.get_name() == "FLASHINFER_MLA_SPARSE"
+            and not uses_flashinfer_sm120_sparse
             and is_quantized_kv_cache(kv_cache_dtype)
         ):
             logger.info_once(

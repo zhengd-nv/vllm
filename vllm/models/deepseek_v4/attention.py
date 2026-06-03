@@ -81,11 +81,25 @@ def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
         )
 
         return DeepseekV4ROCMAiterMLASparseImpl
+    # Consumer Blackwell (SM120) drives sparse-MLA through FlashInfer's MLA
+    # wrapper with backend="sparse-sm120"; SM 9/10 stay on the Hopper FlashMLA
+    # sparse impl.
+    cap = current_platform.get_device_capability()
+    if cap is not None and cap.major == 12:
+        from vllm.models.deepseek_v4.nvidia.sm120 import (
+            DeepseekV4FlashInferSM120SparseImpl,
+        )
+
+        return DeepseekV4FlashInferSM120SparseImpl
     from vllm.models.deepseek_v4.nvidia.flashmla import (
         DeepseekV4FlashMLASparseImpl,
     )
 
     return DeepseekV4FlashMLASparseImpl
+
+
+def get_deepseek_v4_padded_num_q_heads(num_heads: int) -> int:
+    return _select_v4_sparse_impl().get_padded_num_q_heads(num_heads)
 
 
 class DeepseekV4MLA(nn.Module):
@@ -561,6 +575,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+
         # DeepseekV4 only supports fp8 kv-cache format for now.
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 
@@ -593,6 +608,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             compilation_config.static_forward_context[prefix] = self
 
         self.kv_cache = torch.tensor([])
+        self.impl = cast(Any, self.impl_cls(self))
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls
@@ -620,7 +636,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        self.impl_cls.forward_mqa(self, q, kv, positions, output)
+        impl = cast("DeepseekV4SparseMLAAttentionImpl", self.impl)
+        impl.forward_mqa(q, kv, positions, output)
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):

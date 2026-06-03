@@ -120,6 +120,12 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
                 *sparse_backends,
             ]
+        elif device_capability.major == 12:
+            # FLASHINFER_MLA_SPARSE dispatches SM12 sparse MLA to sparse-sm120.
+            return [
+                AttentionBackendEnum.TRITON_MLA,
+                AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+            ]
         else:
             return [
                 AttentionBackendEnum.FLASH_ATTN_MLA,
@@ -556,7 +562,11 @@ class CudaPlatformBase(Platform):
     @classmethod
     def support_deep_gemm(cls) -> bool:
         """Currently, only Hopper and Blackwell GPUs are supported."""
-        return cls.is_device_capability(90) or cls.is_device_capability_family(100)
+        return (
+            cls.is_device_capability(90)
+            or cls.is_device_capability_family(100)
+            or cls.is_device_capability_family(120)
+        )
 
     @classmethod
     def is_integrated_gpu(cls, device_id: int = 0) -> bool:
