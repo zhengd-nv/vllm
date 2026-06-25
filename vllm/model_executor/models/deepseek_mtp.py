@@ -10,6 +10,7 @@ from transformers import PretrainedConfig
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.config.utils import replace as replace_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -38,6 +39,17 @@ from .deepseek_v2 import (
 from .utils import get_pp_missing_layer_names, maybe_prefix
 
 logger = init_logger(__name__)
+
+
+def _uses_unquantized_glm_mtp(vllm_config: VllmConfig) -> bool:
+    quant_config = vllm_config.quant_config
+    if quant_config is None or quant_config.get_name() != "modelopt_fp4":
+        return False
+    hf_config = vllm_config.model_config.hf_config
+    return (
+        getattr(hf_config, "model_type", None) == "glm_moe_dsa"
+        and getattr(hf_config, "num_nextn_predict_layers", 0) > 0
+    )
 
 
 class SharedHead(nn.Module):
@@ -86,11 +98,25 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         else:
             topk_indices_buffer = None
 
+        mtp_vllm_config = vllm_config
+        if _uses_unquantized_glm_mtp(vllm_config):
+            quant_config = None
+            mtp_vllm_config = replace_vllm_config(
+                vllm_config, quant_config=None
+            )
+            # VllmConfig derives quant_config during __post_init__ when it is
+            # None, so set it again after construction for the BF16 MTP block.
+            mtp_vllm_config.quant_config = None
+            logger.info_once(
+                "Loading GLM MTP draft layer without modelopt_fp4 quantization "
+                "because the checkpoint stores MTP layer weights in BF16."
+            )
+
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=quant_config
         )
         self.mtp_block = DeepseekV2DecoderLayer(
-            vllm_config,
+            mtp_vllm_config,
             prefix,
             config=self.config,
             topk_indices_buffer=topk_indices_buffer,
@@ -187,7 +213,11 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
-        self.quant_config = vllm_config.quant_config
+        self.quant_config = (
+            None
+            if _uses_unquantized_glm_mtp(vllm_config)
+            else vllm_config.quant_config
+        )
         self.model = DeepSeekMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
