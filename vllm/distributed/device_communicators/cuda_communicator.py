@@ -93,6 +93,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
+        # allreduce-latency adapter (SM120/PCIe custom kernel). Only attached to
+        # a TP group and only when explicitly enabled; any init failure leaves
+        # it None so dispatch falls through to the existing backends (pynccl).
+        self.arl_comm = None
 
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
@@ -130,6 +134,31 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # On ROCm, 'use_custom_allreduce==True' means it must currently be
             # an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+
+        if "tp" in unique_name and self.world_size > 1:
+            from vllm.distributed.device_communicators.allreduce_latency_config import (  # noqa: E501
+                build_options,
+                is_allreduce_latency_enabled,
+            )
+
+            if is_allreduce_latency_enabled():
+                from vllm.distributed.device_communicators.allreduce_latency import (  # noqa: E501
+                    AllReduceLatency,
+                )
+
+                try:
+                    self.arl_comm = AllReduceLatency(
+                        group=self.cpu_group,
+                        device=self.device,
+                        options=build_options(),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "allreduce-latency adapter disabled (init failed): "
+                        "%s; falling back to the default all-reduce backends.",
+                        e,
+                    )
+                    self.arl_comm = None
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
@@ -219,6 +248,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "QUICK_REDUCE",
             "FLASHINFER",
             "AITER_CUSTOM",
+            "ALLREDUCE_LATENCY",
             "CUSTOM",
             "SYMM_MEM",
             "PYNCCL",
@@ -254,6 +284,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             enabled_ar_backends.append("FLASHINFER")
         if self.aiter_ar_comm is not None and not self.aiter_ar_comm.disabled:
             enabled_ar_backends.append("AITER_CUSTOM")
+        if self.arl_comm is not None and not self.arl_comm.disabled:
+            enabled_ar_backends.append("ALLREDUCE_LATENCY")
         if self.ca_comm is not None and not self.ca_comm.disabled:
             enabled_ar_backends.append("CUSTOM")
         if self.symm_mem_comm is not None and not self.symm_mem_comm.disabled:
@@ -308,6 +340,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = aiter_ar_comm.custom_all_reduce(input_)
             assert out is not None
             return out
+        arl_comm = self.arl_comm
+        if (
+            arl_comm is not None
+            and not arl_comm.disabled
+            and arl_comm.should_custom_ar(input_)
+        ):
+            out = arl_comm.custom_all_reduce(input_)
+            # None means the policy did not cover this exact shape after all;
+            # fall through to the remaining backends (ultimately pynccl).
+            if out is not None:
+                return out
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
@@ -534,6 +577,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
+        if self.arl_comm is not None:
+            self.arl_comm.close()
+            self.arl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.aiter_ar_comm is not None:
