@@ -1139,7 +1139,6 @@ __global__ __launch_bounds__(1024, 1) void tp2_remote_push_kernel(
   if (threadIdx.x == 0) {
     store_volatile_i32(epoch_slot, epoch ^ 1);
   }
-  pdl_grid_release_const<UsePdl>();
 }
 
 template <typename T, bool UsePdl, bool FastSignal>
@@ -1375,8 +1374,8 @@ __global__ __launch_bounds__(1024, 1) void tp2_remote_flag_push_kernel(
       for (int idx = tid; idx < num_packs; idx += stride) {
         uint4 local_value = input[idx];
         store_u4_volatile(peer_buffer, peer_write_base + idx, local_value);
-        store_volatile_i32(peer_flags + peer_write_base + idx, seq);
-        while (load_volatile_i32(local_flags + local_poll_base + idx) < seq) {
+        store_release_i32(peer_flags + peer_write_base + idx, seq);
+        while (load_acquire_i32(local_flags + local_poll_base + idx) < seq) {
         }
         uint4 peer_value =
             load_u4_volatile(local_buffer, local_poll_base + idx);
@@ -1386,10 +1385,10 @@ __global__ __launch_bounds__(1024, 1) void tp2_remote_flag_push_kernel(
     } else {
       for (int idx = tid; idx < num_packs; idx += stride) {
         store_u4_volatile(peer_buffer, peer_write_base + idx, input[idx]);
-        store_volatile_i32(peer_flags + peer_write_base + idx, seq);
+        store_release_i32(peer_flags + peer_write_base + idx, seq);
       }
       for (int idx = tid; idx < num_packs; idx += stride) {
-        while (load_volatile_i32(local_flags + local_poll_base + idx) < seq) {
+        while (load_acquire_i32(local_flags + local_poll_base + idx) < seq) {
         }
         uint4 peer_value =
             load_u4_volatile(local_buffer, local_poll_base + idx);
@@ -1410,8 +1409,8 @@ __global__ __launch_bounds__(1024, 1) void tp2_remote_flag_push_kernel(
         Pack local_value = input[idx];
         store_pack_volatile<T>(peer_buffer, peer_write_base + idx,
                                local_value);
-        store_volatile_i32(peer_flags + peer_write_base + idx, seq);
-        while (load_volatile_i32(local_flags + local_poll_base + idx) < seq) {
+        store_release_i32(peer_flags + peer_write_base + idx, seq);
+        while (load_acquire_i32(local_flags + local_poll_base + idx) < seq) {
         }
         Pack peer_value =
             load_pack_volatile<T>(local_buffer, local_poll_base + idx);
@@ -1421,10 +1420,10 @@ __global__ __launch_bounds__(1024, 1) void tp2_remote_flag_push_kernel(
     } else {
       for (int idx = tid; idx < num_packs; idx += stride) {
         store_pack_volatile<T>(peer_buffer, peer_write_base + idx, input[idx]);
-        store_volatile_i32(peer_flags + peer_write_base + idx, seq);
+        store_release_i32(peer_flags + peer_write_base + idx, seq);
       }
       for (int idx = tid; idx < num_packs; idx += stride) {
-        while (load_volatile_i32(local_flags + local_poll_base + idx) < seq) {
+        while (load_acquire_i32(local_flags + local_poll_base + idx) < seq) {
         }
         Pack peer_value =
             load_pack_volatile<T>(local_buffer, local_poll_base + idx);
@@ -4713,6 +4712,37 @@ size_t align_bytes_128(size_t size) {
   return ((size + 127) / 128) * 128;
 }
 
+std::vector<std::vector<int>> p2p_native_atomic_matrix(
+    const std::vector<int64_t>& devices) {
+  int device_count = 0;
+  C10_CUDA_CHECK(cudaGetDeviceCount(&device_count));
+  std::vector<std::vector<int>> matrix(
+      devices.size(), std::vector<int>(devices.size(), 0));
+  for (size_t src_idx = 0; src_idx < devices.size(); ++src_idx) {
+    int src = static_cast<int>(devices[src_idx]);
+    TORCH_CHECK(src >= 0 && src < device_count, "invalid source device id");
+    for (size_t dst_idx = 0; dst_idx < devices.size(); ++dst_idx) {
+      int dst = static_cast<int>(devices[dst_idx]);
+      TORCH_CHECK(dst >= 0 && dst < device_count,
+                  "invalid destination device id");
+      if (src == dst) {
+        matrix[src_idx][dst_idx] = 1;
+        continue;
+      }
+      int value = 0;
+      cudaError_t status = cudaDeviceGetP2PAttribute(
+          &value, cudaDevP2PAttrNativeAtomicSupported, src, dst);
+      if (status == cudaSuccess) {
+        matrix[src_idx][dst_idx] = value != 0 ? 1 : 0;
+      } else {
+        cudaGetLastError();
+        matrix[src_idx][dst_idx] = 0;
+      }
+    }
+  }
+  return matrix;
+}
+
 class IpcPushAllreduce {
  public:
   IpcPushAllreduce(int64_t rank, int64_t world_size, int64_t max_numel,
@@ -4724,7 +4754,9 @@ class IpcPushAllreduce {
         max_blocks_(max_blocks),
         peer_storage_(static_cast<size_t>(world_size), nullptr),
         peer_signal_ptrs_(static_cast<size_t>(world_size), 0),
-        peer_tmp_ptrs_(static_cast<size_t>(world_size), 0) {
+        peer_tmp_ptrs_(static_cast<size_t>(world_size), 0),
+        peer_v2_pack_tmp_ptrs_(static_cast<size_t>(world_size), 0),
+        peer_v2_block_tmp_ptrs_(static_cast<size_t>(world_size), 0) {
     TORCH_CHECK(world_size_ == 2 || world_size_ == 4 || world_size_ == 8,
                 "IpcPushAllreduce supports world_size 2, 4, or 8");
     TORCH_CHECK(rank_ >= 0 && rank_ < world_size_, "rank out of range");
@@ -4742,7 +4774,10 @@ class IpcPushAllreduce {
                         static_cast<size_t>(elem_size_));
     push_bytes_ = align_bytes_128(2 * static_cast<size_t>(world_size_) *
                                   max_payload_bytes_);
-    storage_bytes_ = epoch_bytes_ + push_bytes_;
+    v2_pack_bytes_ = push_bytes_;
+    v2_block_bytes_ = push_bytes_;
+    storage_bytes_ =
+        epoch_bytes_ + push_bytes_ + v2_pack_bytes_ + v2_block_bytes_;
     C10_CUDA_CHECK(cudaMalloc(&storage_, storage_bytes_));
     C10_CUDA_CHECK(cudaMemset(storage_, 0, storage_bytes_));
   }
@@ -4784,6 +4819,10 @@ class IpcPushAllreduce {
           static_cast<ptrdiff_t>(epoch_bytes_);
       peer_tmp_ptrs_[static_cast<size_t>(peer)] =
           reinterpret_cast<uint64_t>(peer_base);
+      peer_v2_pack_tmp_ptrs_[static_cast<size_t>(peer)] =
+          reinterpret_cast<uint64_t>(peer_base + push_bytes_);
+      peer_v2_block_tmp_ptrs_[static_cast<size_t>(peer)] =
+          reinterpret_cast<uint64_t>(peer_base + push_bytes_ + v2_pack_bytes_);
     }
     initialized_ = true;
   }
@@ -4879,7 +4918,7 @@ class IpcPushAllreduce {
     int64_t rank_stride = max_numel_ / Traits::kPackElems;                      \
     int64_t epoch_stride = world_size_ * rank_stride;                           \
     launch_push_oneshot_param_raw<DTYPE>(                                       \
-        input, peer_tmp_ptrs_, epoch_slots, output, numel, rank_, world_size_,  \
+        input, peer_v2_pack_tmp_ptrs_, epoch_slots, output, numel, rank_, world_size_,\
         max_blocks_, blocks, threads, pdl_sync, pdl_release, false,             \
         rank_stride, epoch_stride);                                             \
   } while (false)
@@ -4919,7 +4958,7 @@ class IpcPushAllreduce {
         at::cuda::getCurrentCUDAStream(output.get_device()).stream();          \
     PushOneshotParamData<DTYPE> params{};                                      \
     for (int64_t peer = 0; peer < world_size_; ++peer) {                       \
-      params.tmp_ptrs[peer] = peer_tmp_ptrs_[static_cast<size_t>(peer)];       \
+      params.tmp_ptrs[peer] = peer_v2_block_tmp_ptrs_[static_cast<size_t>(peer)];\
       params.signal_ptrs[peer] =                                               \
           peer_signal_ptrs_[static_cast<size_t>(peer)];                        \
     }                                                                          \
@@ -4966,7 +5005,7 @@ class IpcPushAllreduce {
         at::cuda::getCurrentCUDAStream(output.get_device()).stream();          \
     PushOneshotParamData<DTYPE> params{};                                      \
     for (int64_t peer = 0; peer < world_size_; ++peer) {                       \
-      params.tmp_ptrs[peer] = peer_tmp_ptrs_[static_cast<size_t>(peer)];       \
+      params.tmp_ptrs[peer] = peer_v2_pack_tmp_ptrs_[static_cast<size_t>(peer)];\
       params.signal_ptrs[peer] =                                               \
           peer_signal_ptrs_[static_cast<size_t>(peer)];                        \
     }                                                                          \
@@ -5035,8 +5074,8 @@ class IpcPushAllreduce {
     TORCH_CHECK(numel % Traits::kPackElems == 0,                                \
                 "numel must be divisible by the 16-byte pack width");          \
     IpcTp2RemotePushData<DTYPE> params{};                                       \
-    params.tmp_ptrs[0] = peer_tmp_ptrs_[0];                                     \
-    params.tmp_ptrs[1] = peer_tmp_ptrs_[1];                                     \
+    params.tmp_ptrs[0] = peer_v2_block_tmp_ptrs_[0];                            \
+    params.tmp_ptrs[1] = peer_v2_block_tmp_ptrs_[1];                            \
     params.input = reinterpret_cast<DTYPE const*>(input.data_ptr());            \
     params.output = reinterpret_cast<DTYPE*>(output.data_ptr());                \
     params.epoch_slots = epoch_slots;                                           \
@@ -5085,7 +5124,7 @@ class IpcPushAllreduce {
 #undef LAUNCH_IPC_V2
   }
 
-  void close() {
+  void close_peers() {
     for (int64_t peer = 0; peer < world_size_; ++peer) {
       void* ptr = peer_storage_[static_cast<size_t>(peer)];
       if (ptr != nullptr && ptr != storage_) {
@@ -5093,11 +5132,22 @@ class IpcPushAllreduce {
         peer_storage_[static_cast<size_t>(peer)] = nullptr;
       }
     }
+    initialized_ = false;
+  }
+
+  void free_storage() {
     if (storage_ != nullptr) {
       cudaFree(storage_);
       storage_ = nullptr;
     }
-    initialized_ = false;
+    if (rank_ >= 0 && rank_ < world_size_) {
+      peer_storage_[static_cast<size_t>(rank_)] = nullptr;
+    }
+  }
+
+  void close() {
+    close_peers();
+    free_storage();
   }
 
  private:
@@ -5110,12 +5160,16 @@ class IpcPushAllreduce {
   size_t epoch_bytes_ = 0;
   size_t max_payload_bytes_ = 0;
   size_t push_bytes_ = 0;
+  size_t v2_pack_bytes_ = 0;
+  size_t v2_block_bytes_ = 0;
   size_t storage_bytes_ = 0;
   void* storage_ = nullptr;
   bool initialized_ = false;
   std::vector<void*> peer_storage_;
   std::vector<uint64_t> peer_signal_ptrs_;
   std::vector<uint64_t> peer_tmp_ptrs_;
+  std::vector<uint64_t> peer_v2_pack_tmp_ptrs_;
+  std::vector<uint64_t> peer_v2_block_tmp_ptrs_;
 };
 
 }  // namespace
@@ -6703,7 +6757,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("input"), py::arg("output"), py::arg("numel"),
            py::arg("blocks"), py::arg("threads"), py::arg("stream_mode"),
            py::arg("pdl_sync") = false, py::arg("pdl_release") = false)
+      .def("close_peers", &IpcPushAllreduce::close_peers)
+      .def("free_storage", &IpcPushAllreduce::free_storage)
       .def("close", &IpcPushAllreduce::close);
+  m.def("p2p_native_atomic_matrix", &p2p_native_atomic_matrix,
+        "Return cudaDevP2PAttrNativeAtomicSupported for directed device pairs",
+        py::arg("devices"));
   m.def("oneshot", &oneshot,
         "TP allreduce oneshot over symmetric memory",
         py::arg("input_ptrs"), py::arg("signal_ptrs"), py::arg("output"),
