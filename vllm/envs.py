@@ -1550,6 +1550,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Opt into the FlashInfer SM90 "humming" MXFP4-weight x FP8-activation
     # fused-MoE CUTLASS backend (PR #3738) for DeepSeek-V4 on Hopper.
+    # Equivalent to `--moe-backend flashinfer_cutlass_humming`, but only
+    # applies on SM90 and yields to an explicit `--moe-backend`. Precedence:
+    # explicit --moe-backend > this env > automatic backend selection.
     "VLLM_USE_FLASHINFER_MOE_WFP4AFP8_HUMMING": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_WFP4AFP8_HUMMING", "0"))
     ),
