@@ -608,18 +608,20 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     # marlin arches for fp16 output
     # Family-conditional 12.0f (one cubin for SM12x family) requires CUDA >= 13.0;
     # fall back to architecture-specific 12.0a;12.1a on CUDA < 13.0 (e.g. 12.8).
+    # Build native SM90 cubins for Hopper so SM90 deployments do not rely on PTX
+    # JIT fallback from the SM80 forward-compat path.
     if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-      cuda_archs_loose_intersection(MARLIN_ARCHS "8.0+PTX;12.0f" "${CUDA_ARCHS}")
+      cuda_archs_loose_intersection(MARLIN_ARCHS "8.0+PTX;9.0;12.0f" "${CUDA_ARCHS}")
     else()
-      cuda_archs_loose_intersection(MARLIN_ARCHS "8.0+PTX;12.0a;12.1a" "${CUDA_ARCHS}")
+      cuda_archs_loose_intersection(MARLIN_ARCHS "8.0+PTX;9.0;12.0a;12.1a" "${CUDA_ARCHS}")
     endif()
     # marlin has limited support for turing
     cuda_archs_loose_intersection(MARLIN_SM75_ARCHS "7.5" "${CUDA_ARCHS}")
-    # marlin arches for bf16 output (we need 9.0 for bf16 atomicAdd PTX)
+    # marlin arches for bf16 output (SM90 covers bf16 atomicAdd support natively)
     if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-      cuda_archs_loose_intersection(MARLIN_BF16_ARCHS "8.0+PTX;9.0+PTX;12.0f" "${CUDA_ARCHS}")
+      cuda_archs_loose_intersection(MARLIN_BF16_ARCHS "8.0+PTX;9.0;12.0f" "${CUDA_ARCHS}")
     else()
-      cuda_archs_loose_intersection(MARLIN_BF16_ARCHS "8.0+PTX;9.0+PTX;12.0a;12.1a" "${CUDA_ARCHS}")
+      cuda_archs_loose_intersection(MARLIN_BF16_ARCHS "8.0+PTX;9.0;12.0a;12.1a" "${CUDA_ARCHS}")
     endif()
     # marlin arches for fp8 input
     # - sm80 doesn't support fp8 computation
@@ -630,8 +632,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     else()
       cuda_archs_loose_intersection(MARLIN_FP8_ARCHS "8.9;12.0a;12.1a" "${CUDA_ARCHS}")
     endif()
-    # marlin arches for other files
-    cuda_archs_loose_intersection(MARLIN_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
+    # marlin arches for other files, including repack/preprocess kernels that run
+    # during MXFP4 Marlin weight preparation.
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+      cuda_archs_loose_intersection(MARLIN_OTHER_ARCHS "7.5;8.0+PTX;9.0;12.0f" "${CUDA_ARCHS}")
+    else()
+      cuda_archs_loose_intersection(MARLIN_OTHER_ARCHS "7.5;8.0+PTX;9.0;12.0a;12.1a" "${CUDA_ARCHS}")
+    endif()
 
     if (MARLIN_OTHER_ARCHS)
 
@@ -1306,11 +1313,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_MOE_EXT_SRC "${VLLM_MOE_WNA16_SRC}")
   # moe marlin arches
   # note that we always set `use_atomic_add=False` for moe marlin now,
-  # so we don't need 9.0 for bf16 atomicAdd PTX
+  # but we still build native SM90 cubins to avoid PTX JIT fallback on Hopper.
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-    cuda_archs_loose_intersection(MARLIN_MOE_ARCHS "8.0+PTX;12.0f" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(MARLIN_MOE_ARCHS "8.0+PTX;9.0;12.0f" "${CUDA_ARCHS}")
   else()
-    cuda_archs_loose_intersection(MARLIN_MOE_ARCHS "8.0+PTX;12.0a;12.1a" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(MARLIN_MOE_ARCHS "8.0+PTX;9.0;12.0a;12.1a" "${CUDA_ARCHS}")
   endif()
   # moe marlin has limited support for turing
   cuda_archs_loose_intersection(MARLIN_MOE_SM75_ARCHS "7.5" "${CUDA_ARCHS}")
@@ -1323,8 +1330,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   else()
     cuda_archs_loose_intersection(MARLIN_MOE_FP8_ARCHS "8.9;12.0a;12.1a" "${CUDA_ARCHS}")
   endif()
-  # moe marlin arches for other files
-  cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
+  # moe marlin arches for other files, including repack/preprocess kernels that
+  # run during MXFP4 Marlin weight preparation.
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0+PTX;9.0;12.0f" "${CUDA_ARCHS}")
+  else()
+    cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0+PTX;9.0;12.0a;12.1a" "${CUDA_ARCHS}")
+  endif()
   if (MARLIN_MOE_OTHER_ARCHS)
 
     #
