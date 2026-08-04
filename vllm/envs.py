@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_MOE_SKIP_PADDING: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
+    VLLM_USE_FLASHINFER_MOE_WFP4AFP8_HUMMING: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -1505,6 +1506,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))
+    ),
+    # Opt into the FlashInfer SM90 "humming" MXFP4-weight x FP8-activation
+    # fused-MoE CUTLASS backend (PR #3738) for DeepSeek-V4 on Hopper.
+    "VLLM_USE_FLASHINFER_MOE_WFP4AFP8_HUMMING": lambda: bool(
+        int(os.getenv("VLLM_USE_FLASHINFER_MOE_WFP4AFP8_HUMMING", "0"))
     ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
