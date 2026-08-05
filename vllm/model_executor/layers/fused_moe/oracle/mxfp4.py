@@ -669,6 +669,27 @@ def select_deepseek_v4_mxfp4_moe_backend(
         assert last_error is not None
         raise last_error
 
+    # LOCAL ONLY -- not part of the upstream PR, which ships --moe-backend
+    # alone. Keeps this workspace's HUMMING=0/1 serve knob working. Precedence
+    # is `--moe-backend <explicit>` (handled above) > this env > the auto
+    # priority list below; unlike the explicit flag it stays silent when the
+    # kernel is unavailable, so exporting it fleet-wide cannot break a host.
+    if (
+        envs.VLLM_USE_FLASHINFER_MOE_WFP4AFP8_HUMMING
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(90)
+        and has_flashinfer_humming_moe()
+    ):
+        return _return_or_raise(
+            Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_FP8_HUMMING,
+            config,
+            kMxfp4Static,
+            _backend_activation_key(
+                Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_FP8_HUMMING
+            ),
+            activation_format,
+        )
+
     # DeepSeek-V4 on ROCm: prefer AITER FlyDSL MoE (better perf + accuracy
     # after shuffle/TP-offset fixes), with Triton-unfused as fallback.
     if (
