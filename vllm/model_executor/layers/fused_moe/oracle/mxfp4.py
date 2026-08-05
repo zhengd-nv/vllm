@@ -44,6 +44,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import all_close_1d
 from vllm.platforms import current_platform
+from vllm.utils.flashinfer import has_flashinfer_humming_moe
 from vllm.utils.import_utils import has_triton_kernels
 from vllm.utils.math_utils import round_up
 
@@ -413,23 +414,30 @@ def _make_log_unsupported(backend: Mxfp4MoeBackend, reason: str | None) -> str:
     return f"{base} since {reason}." if reason else f"{base}."
 
 
-def _check_explicit_backend_platform(
+def _check_explicit_backend_requirements(
     runner_backend: MoEBackend, backends: list[Mxfp4MoeBackend]
 ) -> None:
-    """Fail fast on an explicitly requested backend that this device can never
-    run, so the user gets a hardware hint instead of the generic
-    "does not support the deployment configuration" from `_return_or_raise`."""
+    """Fail fast on an explicitly requested backend this deployment can never
+    run, so the user gets an actionable hint instead of the generic "does not
+    support the deployment configuration" from `_return_or_raise` -- or, for a
+    FlashInfer too old to carry the kernel, an ImportError raised deep inside
+    weight loading."""
     if Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_FP8_HUMMING not in backends:
         return
-    if current_platform.is_cuda() and current_platform.is_device_capability(90):
-        return
-    raise ValueError(
-        f"moe_backend={runner_backend!r} selects the FlashInfer CUTLASS "
-        "humming MXFP4-weight x FP8-activation MoE kernel, which is "
-        "implemented for SM90 (Hopper) only; this device reports compute "
-        f"capability {current_platform.get_device_capability()}. Drop the "
-        "flag to fall back to the automatic backend selection."
-    )
+    if not (current_platform.is_cuda() and current_platform.is_device_capability(90)):
+        raise ValueError(
+            f"moe_backend={runner_backend!r} selects the FlashInfer CUTLASS "
+            "humming MXFP4-weight x FP8-activation MoE kernel, which is "
+            "implemented for SM90 (Hopper) only; this device reports compute "
+            f"capability {current_platform.get_device_capability()}. Drop the "
+            "flag to fall back to the automatic backend selection."
+        )
+    if not has_flashinfer_humming_moe():
+        raise ValueError(
+            f"moe_backend={runner_backend!r} needs the FlashInfer humming "
+            "MXFP4 x FP8 MoE kernel, which the installed FlashInfer does not "
+            "provide; it requires flashinfer-python>=0.6.16."
+        )
 
 
 def _return_or_raise(
@@ -495,7 +503,7 @@ def select_mxfp4_moe_backend(
     runner_backend = config.moe_backend
     if runner_backend != "auto":
         requested_backends = map_mxfp4_backend(runner_backend)
-        _check_explicit_backend_platform(runner_backend, requested_backends)
+        _check_explicit_backend_requirements(runner_backend, requested_backends)
         if activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
             requested_backends = [
                 Mxfp4MoeBackend.BATCHED_MARLIN if b == Mxfp4MoeBackend.MARLIN else b
@@ -607,7 +615,7 @@ def select_deepseek_v4_mxfp4_moe_backend(
     runner_backend = config.moe_backend
     if runner_backend != "auto":
         requested_backends = map_mxfp4_backend(runner_backend)
-        _check_explicit_backend_platform(runner_backend, requested_backends)
+        _check_explicit_backend_requirements(runner_backend, requested_backends)
         if activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
             requested_backends = [
                 Mxfp4MoeBackend.BATCHED_MARLIN if b == Mxfp4MoeBackend.MARLIN else b
